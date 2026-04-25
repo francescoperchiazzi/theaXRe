@@ -2197,6 +2197,7 @@ Draw a polygon around your subject to remove the paper background. Everything ou
             let currentMaskSlot = -1;
             let maskPoints = [];
             let maskImage = null;
+            let maskImageClose = null;
             let sceneFilesOrig = new Array(6).fill(null);
             let currentMaskScale = 1;
             let maskPanX = 0;
@@ -2295,6 +2296,123 @@ Draw a polygon around your subject to remove the paper background. Everything ou
                 ctx.textAlign = 'center';
                 ctx.fillText('Auto-cut area (Draw a mask to override)', cw / 2, ch / 2);
               }
+            }
+
+            function getJpegOrientation(buffer) {
+              const view = new DataView(buffer);
+              if (view.byteLength < 4) return 1;
+              if (view.getUint16(0, false) !== 0xFFD8) return 1;
+              let offset = 2;
+              while (offset + 4 <= view.byteLength) {
+                const marker = view.getUint16(offset, false);
+                offset += 2;
+                if ((marker & 0xFF00) !== 0xFF00) break;
+                const length = view.getUint16(offset, false);
+                offset += 2;
+                if (length < 2) break;
+                if (marker === 0xFFE1 && offset + 8 <= view.byteLength) {
+                  if (view.getUint32(offset, false) !== 0x45786966) return 1;
+                  const tiffOffset = offset + 6;
+                  if (tiffOffset + 8 > view.byteLength) return 1;
+                  const endian = view.getUint16(tiffOffset, false);
+                  const little = endian === 0x4949;
+                  if (!little && endian !== 0x4D4D) return 1;
+                  const u16 = (o) => view.getUint16(o, little);
+                  const u32 = (o) => view.getUint32(o, little);
+                  if (u16(tiffOffset + 2) !== 0x002A) return 1;
+                  const ifd0 = tiffOffset + u32(tiffOffset + 4);
+                  if (ifd0 + 2 > view.byteLength) return 1;
+                  const entries = u16(ifd0);
+                  for (let i = 0; i < entries; i++) {
+                    const entry = ifd0 + 2 + i * 12;
+                    if (entry + 12 > view.byteLength) break;
+                    const tag = u16(entry);
+                    if (tag !== 0x0112) continue;
+                    const type = u16(entry + 2);
+                    const count = u32(entry + 4);
+                    if (type !== 3 || count !== 1) return 1;
+                    return u16(entry + 8);
+                  }
+                  return 1;
+                }
+                offset += length - 2;
+              }
+              return 1;
+            }
+
+            function orientedCanvasFromSource(source, orientation) {
+              const w = source.width;
+              const h = source.height;
+              const canvas = document.createElement('canvas');
+              const swap = orientation >= 5 && orientation <= 8;
+              canvas.width = swap ? h : w;
+              canvas.height = swap ? w : h;
+              const ctx = canvas.getContext('2d');
+              if (!ctx) return canvas;
+              switch (orientation) {
+                case 2:
+                  ctx.scale(-1, 1);
+                  ctx.drawImage(source, -w, 0);
+                  break;
+                case 3:
+                  ctx.rotate(Math.PI);
+                  ctx.drawImage(source, -w, -h);
+                  break;
+                case 4:
+                  ctx.scale(1, -1);
+                  ctx.drawImage(source, 0, -h);
+                  break;
+                case 5:
+                  ctx.rotate(Math.PI / 2);
+                  ctx.scale(1, -1);
+                  ctx.drawImage(source, 0, -h);
+                  break;
+                case 6:
+                  ctx.rotate(Math.PI / 2);
+                  ctx.drawImage(source, 0, -h);
+                  break;
+                case 7:
+                  ctx.rotate(Math.PI / 2);
+                  ctx.scale(-1, 1);
+                  ctx.drawImage(source, -w, -h);
+                  break;
+                case 8:
+                  ctx.rotate(-Math.PI / 2);
+                  ctx.drawImage(source, -w, 0);
+                  break;
+                default:
+                  ctx.drawImage(source, 0, 0);
+              }
+              return canvas;
+            }
+
+            async function decodeOrientedDrawable(file) {
+              if (typeof createImageBitmap === 'function') {
+                try {
+                  const oriented = await createImageBitmap(file, { imageOrientation: 'from-image' });
+                  return { drawable: oriented, close: () => oriented.close && oriented.close() };
+                } catch {}
+                const bitmap = await createImageBitmap(file);
+                if (file.type === 'image/jpeg') {
+                  const head = await file.slice(0, 65536).arrayBuffer();
+                  const orientation = getJpegOrientation(head);
+                  if (orientation && orientation !== 1) {
+                    const canvas = orientedCanvasFromSource(bitmap, orientation);
+                    if (bitmap.close) bitmap.close();
+                    return { drawable: canvas, close: null };
+                  }
+                }
+                return { drawable: bitmap, close: () => bitmap.close && bitmap.close() };
+              }
+              const url = URL.createObjectURL(file);
+              const img = new Image();
+              await new Promise((resolve, reject) => {
+                img.onload = resolve;
+                img.onerror = reject;
+                img.src = url;
+              });
+              if (url.startsWith('blob:')) URL.revokeObjectURL(url);
+              return { drawable: img, close: null };
             }
             
             maskCanvas.addEventListener('pointerdown', (e) => {
@@ -2481,6 +2599,10 @@ Draw a polygon around your subject to remove the paper background. Everything ou
             
             btnMaskCancel.addEventListener('click', () => {
               maskModal.hidden = true;
+              if (maskImageClose) {
+                try { maskImageClose(); } catch {}
+                maskImageClose = null;
+              }
             });
             
             btnMaskReset.addEventListener('click', () => {
@@ -2583,26 +2705,28 @@ Draw a polygon around your subject to remove the paper background. Everything ou
                 slotUi[currentMaskSlot].img.src = url;
                 
                 maskModal.hidden = true;
+                if (maskImageClose) {
+                  try { maskImageClose(); } catch {}
+                  maskImageClose = null;
+                }
                 rebuildSceneFromSlots();
                 updateScenePreview();
               }, 'image/png');
             });
             
-            function openMaskModal(slotIndex) {
+            async function openMaskModal(slotIndex) {
               currentMaskSlot = slotIndex;
               maskPoints = [];
               const file = sceneFilesOrig[slotIndex] || sceneFiles[slotIndex];
               if (!file) return;
             
-              if (maskImage && typeof maskImage.src === 'string' && maskImage.src.startsWith('blob:')) {
-                URL.revokeObjectURL(maskImage.src);
+              if (maskImageClose) {
+                try { maskImageClose(); } catch {}
+                maskImageClose = null;
               }
-              const url = URL.createObjectURL(file);
-              maskImage = new Image();
-              maskImage.onload = () => {
-                if (url.startsWith('blob:')) {
-                  URL.revokeObjectURL(url);
-                }
+              const decoded = await decodeOrientedDrawable(file);
+              maskImage = decoded.drawable;
+              maskImageClose = decoded.close;
                 // We want a crop canvas that matches the target shape's aspect ratio
                 const isBackdrop = (currentMaskSlot === 0);
                 const shape = isBackdrop ? 'backdrop' : (slotShape[currentMaskSlot] || 'square');
@@ -2665,8 +2789,6 @@ Draw a polygon around your subject to remove the paper background. Everything ou
             
                 maskModal.hidden = false;
                 drawMaskCanvas();
-              };
-              maskImage.src = url;
             }
             
             async function setSlotFile(slotIndex, file) {
@@ -3934,7 +4056,8 @@ Draw a polygon around your subject to remove the paper background. Everything ou
               }
             
               const { flipX = false, flipY = false, forceSquare = false, targetShape = 'square' } = opts;
-              const bitmap = await createImageBitmap(file);
+              const decoded = await decodeOrientedDrawable(file);
+              const bitmap = decoded.drawable;
               try {
                 let canvasW = bitmap.width;
                 let canvasH = bitmap.height;
@@ -4048,7 +4171,7 @@ Draw a polygon around your subject to remove the paper background. Everything ou
               } catch (err) {
                 throw new Error(`Crop failed for shape "${targetShape}": ${err instanceof Error ? err.message : String(err)}`);
               } finally {
-                if (bitmap.close) bitmap.close();
+                if (decoded.close) decoded.close();
               }
             }
          </script>
